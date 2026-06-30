@@ -263,22 +263,69 @@ createApp({
             const reader = res.body.getReader();
             const decoder = new TextDecoder("utf-8");
             let buffer = "";
+            let gotContent = false;
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
                 buffer += decoder.decode(value, { stream: true });
-                // 解析 SSE 数据行：data: {内容}\n\n
                 const lines = buffer.split("\n");
-                // 最后一行可能不完整，保留在 buffer 中
                 buffer = lines.pop();
                 for (const line of lines) {
                     if (line.startsWith("data: ")) {
-                        const payload = line.slice(6); // 去掉 "data: " 前缀
+                        const payload = line.slice(6);
                         if (payload === "[DONE]") {
-                            return; // 流结束
+                            if (!gotContent) throw new Error("TIMEOUT");
+                            return;
                         }
                         const cleaned = cleanChunk(payload);
-                        if (cleaned) onChunk(cleaned);
+                        if (cleaned) { gotContent = true; onChunk(cleaned); }
+                    }
+                }
+            }
+            if (!gotContent) throw new Error("TIMEOUT");
+        };
+
+        // ============ 兜底：直接调 Coze API（绕过 Netlify 10s 限制）============
+        const COZE_PAT = "pat_zAV00pJuQCGGwvfoA1pTq4HCvpEh0ptrqbojc5Yj3QzCDYmEg3dB7IFCkgEZKswd";
+        const COZE_BOT_ID = "7654942789465702452";
+        const fetchCozeDirect = async (query, onChunk) => {
+            const res = await fetch("https://api.coze.cn/v3/chat", {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${COZE_PAT}`,
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream"
+                },
+                body: JSON.stringify({
+                    bot_id: COZE_BOT_ID,
+                    user_id: USER_ID,
+                    stream: true,
+                    additional_messages: [{ role: "user", content: query, content_type: "text" }]
+                })
+            });
+            if (!res.ok) {
+                throw new Error(`Coze API 请求失败 (HTTP ${res.status})`);
+            }
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let buffer = "";
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (line.startsWith("data:")) {
+                        const payload = line.slice(5).trim();
+                        if (!payload || payload === "[DONE]") continue;
+                        try {
+                            const json = JSON.parse(payload);
+                            const text = json.content || "";
+                            if (text) onChunk(text);
+                        } catch (e) {
+                            // 非 JSON，跳过
+                        }
                     }
                 }
             }
@@ -372,25 +419,24 @@ createApp({
                 return;
             }
 
-            try {
-                await fetchCozeChat(query, (chunkText) => {
+            // 优先走后端，超时则自动切 Coze 直连
+            const doChat = async (useDirect) => {
+                const fetcher = useDirect ? fetchCozeDirect : fetchCozeChat;
+                await fetcher(query, (chunkText) => {
                     if (!aiMsg) {
-                        // 首个 chunk：关闭 loading，创建 AI 消息
                         loading.value = false;
-                        aiMsg = {
-                            id: msgId++,
-                            type: "ai",
-                            content: chunkText
-                        };
+                        aiMsg = { id: msgId++, type: "ai", content: chunkText };
                         msgList.value.push(aiMsg);
                     } else {
-                        // 后续 chunk：追加内容
                         aiMsg.content += chunkText;
                     }
                     scrollToBottom();
                     updateCurrentSessionMsg();
                 });
-                // 流正常结束（收到 [DONE]），若后端未返回任何内容则给个兜底
+            };
+
+            try {
+                await doChat(false);
                 if (!aiMsg) {
                     loading.value = false;
                     msgList.value.push({
@@ -401,15 +447,44 @@ createApp({
                 }
                 updateCurrentSessionMsg();
             } catch (err) {
+                // 后端超时 → 自动切 Coze 直连
+                if (err.message === "TIMEOUT") {
+                    console.log("后端超时，切换 Coze 直连...");
+                    try {
+                        await doChat(true);
+                        if (!aiMsg) {
+                            loading.value = false;
+                            msgList.value.push({
+                                id: msgId++,
+                                type: "ai",
+                                content: currentLang.value === 'zh' ? '（暂无回复内容）' : '(No response)'
+                            });
+                        }
+                        updateCurrentSessionMsg();
+                        return;
+                    } catch (err2) {
+                        loading.value = false;
+                        if (aiMsg) {
+                            aiMsg.content += `\n\n[请求中断：${err2.message}]`;
+                        } else {
+                            msgList.value.push({
+                                id: msgId++,
+                                type: "ai",
+                                content: `请求失败：${err2.message}`
+                            });
+                        }
+                        updateCurrentSessionMsg();
+                        return;
+                    }
+                }
                 loading.value = false;
-                // 若已开始流式输出但中途出错，在已有气泡后追加错误提示
                 if (aiMsg) {
                     aiMsg.content += `\n\n[请求中断：${err.message}]`;
                 } else {
                     msgList.value.push({
                         id: msgId++,
                         type: "ai",
-                        content: `请求失败：${err.message}\n请确认后端服务已启动（localhost:3000）`
+                        content: `请求失败：${err.message}`
                     });
                 }
                 updateCurrentSessionMsg();
