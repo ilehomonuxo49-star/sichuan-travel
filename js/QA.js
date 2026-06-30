@@ -273,6 +273,7 @@ createApp({
                 for (const line of lines) {
                     if (line.startsWith("data: ")) {
                         const payload = line.slice(6);
+                        if (payload === "[TIMEOUT]") throw new Error("TIMEOUT");
                         if (payload === "[DONE]") {
                             if (!gotContent) throw new Error("TIMEOUT");
                             return;

@@ -74,20 +74,21 @@ exports.handler = async (event) => {
             }
         }
 
-        if (!answer) {
-            answer = "AI正在思考中，请稍后再试~（免费部署有10秒超时限制）";
-        }
-
-        // 3. 模拟 SSE 流式返回给前端
-        const cleaned = answer
-            .replace(/([。！？；])(?!\n)/g, '$1\n')
-            .replace(/\\n/g, '\n');
-        const lines = cleaned.split('\n');
+        // 3. 返回 SSE（没拿到答案时发 [TIMEOUT] 让前端切 Coze 直连）
         let sse = "";
-        for (const line of lines) {
-            if (line.trim()) {
-                sse += `data: ${line.trim()}\n\n`;
+        if (answer) {
+            const cleaned = answer
+                .replace(/([。！？；])(?!\n)/g, '$1\n')
+                .replace(/\\n/g, '\n');
+            const lines = cleaned.split('\n');
+            for (const line of lines) {
+                if (line.trim()) {
+                    sse += `data: ${line.trim()}\n\n`;
+                }
             }
+        } else {
+            // 无答案 → 发超时信号，前端自动切 Coze 直连
+            sse = "data: [TIMEOUT]\n\n";
         }
         sse += `data: [DONE]\n\n`;
 
